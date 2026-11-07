@@ -65,7 +65,13 @@ def load_seed_keys(data_dir):
 
 def load_gateway_config(data_dir):
     raw = load_json(Path(data_dir) / "gateway_config.sample.json")
-    providers = [ProviderConfig(p["name"], p["base_url"], p["api_key"]) for p in raw["providers"]]
+    # Deployment overrides (used by Docker): PRISM_PROVIDER_<NAME>_URL / _API_KEY replace the JSON values,
+    # e.g. PRISM_PROVIDER_ALPHA_URL=http://alpha:9001/v1 so containers reach each other by service name.
+    providers = []
+    for p in raw["providers"]:
+        env = "PRISM_PROVIDER_" + p["name"].upper()
+        providers.append(ProviderConfig(p["name"], os.environ.get(env + "_URL", p["base_url"]),
+                                        os.environ.get(env + "_API_KEY", p["api_key"])))
     aliases, auto = {}, {"simple": "fast", "complex": "smart"}
     for name, spec in raw["model_aliases"].items():
         if "route_by_difficulty" in spec:
