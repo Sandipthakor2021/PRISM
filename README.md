@@ -8,7 +8,116 @@ cache, and meters every request. Built with **Python 3.10+, FastAPI, SQLite, htt
 The original capstone brief is in `PRISM_PROBLEM_STATEMENT.md` and `docs/`; the provided pack README is kept at
 `docs/CAPSTONE_PACK_README.md`. Latest verification results: `docs/VERIFICATION_REPORT.md`.
 
-## Quick start
+## Run with Docker (recommended)
+
+One image runs three containers: the **gateway** and two **mock providers** (`alpha`, `beta`). Compose wires them together,
+waits for the providers to be healthy, and keeps the SQLite database in a named volume.
+
+### Prerequisites
+- Docker Desktop (Mac/Windows) or Docker Engine with the Compose plugin (Linux). Check: `docker --version` and `docker compose version`.
+- Docker must be **running** (whale icon in the menu bar on Mac).
+- Ports **8080**, **9001** and **9002** must be free. Stop any locally running gateway or mock providers first.
+
+### Start
+
+```bash
+docker compose up --build          # foreground, logs from all three containers; Ctrl+C stops them
+# or in the background:
+docker compose up --build -d
+docker compose ps                  # all three should become "healthy"
+docker compose logs -f gateway     # follow gateway logs
+```
+
+First build takes a minute or two (it installs the Python dependencies); later starts are fast thanks to layer caching.
+
+### Check it works
+- Health: <http://localhost:8080/health> -> `{"status":"ok","providers":["alpha","beta"]}`
+- Ops console: <http://localhost:8080/console> (admin token `prism-admin-demo`)
+- One request:
+  ```bash
+  curl -si localhost:8080/v1/chat/completions -H "Authorization: Bearer prism-sk-search-1a2b3c" \
+    -H 'Content-Type: application/json' -d '{"model":"fast","messages":[{"role":"user","content":"What is a message queue?"}]}'
+  ```
+
+### Run the verification against the containers
+The scripts run on your host (Python 3.10+, standard library only for the three provided scripts) and talk to the published ports:
+
+```bash
+python3 scripts/smoke_test.py --url http://localhost:8080 --key prism-sk-search-1a2b3c --model fast
+python3 scripts/load_test.py  --url http://localhost:8080 --key prism-sk-free-7g8h9i --model fast --requests 30 --concurrency 10 --rpm-limit 10
+python3 scripts/routing_eval.py        # needs no gateway; uses the same classifier code
+python3 scripts/verify.py              # everything + drills; writes docs/VERIFICATION_REPORT.md (about 90 s)
+```
+Or run the unit/integration tests inside a container, with no local Python setup:
+
+```bash
+docker compose run --rm --no-deps gateway python -m pytest -q
+```
+`verify.py` is best run on a fresh database (`docker compose down -v && docker compose up -d`), because the budget-demo key can only be used up once per month.
+
+### Failure injection (live demo)
+The mock providers' admin ports are published, so you can break a provider while the stack runs:
+
+```bash
+curl -X POST localhost:9001/admin/config -d '{"mode":"down"}'                          # alpha down -> requests fail over to beta
+curl -X POST localhost:9001/admin/config -d '{"mode":"ok","latency_ms":3000}'          # alpha slow -> 2.5 s timeout -> failover
+curl -X POST localhost:9001/admin/config -d '{"mode":"ok","fail_rate":0.3,"latency_ms":0}'   # flaky -> retries absorb most errors
+curl -X POST localhost:9001/admin/config -d '{"mode":"ok","fail_rate":0,"latency_ms":0}'     # restore
+```
+(Or stop the container outright: `docker compose stop alpha`, then `docker compose start alpha`.)
+
+### Stop, restart, reset
+```bash
+docker compose down            # stop and remove containers; the database volume is KEPT
+docker compose down -v         # also delete the database volume (fresh usage counters, empty logs and cache)
+docker compose restart gateway # restart only the gateway (rate-limit windows reset; usage persists)
+docker compose build --no-cache   # rebuild the image from scratch
+```
+
+### Configuration (environment variables)
+
+| Variable | Default in compose | Meaning |
+|---|---|---|
+| `PRISM_PROVIDER_ALPHA_URL` | `http://alpha:9001/v1` | upstream base URL for provider `alpha` (any `PRISM_PROVIDER_<NAME>_URL` works) |
+| `PRISM_PROVIDER_BETA_URL` | `http://beta:9002/v1` | upstream base URL for provider `beta` |
+| `PRISM_PROVIDER_<NAME>_API_KEY` | from `data/gateway_config.sample.json` | provider secret; set it to use a real provider without editing JSON |
+| `PRISM_ADMIN_TOKEN` | `prism-admin-demo` | token for `/admin/*`; override with `PRISM_ADMIN_TOKEN=... docker compose up` |
+| `PRISM_UPSTREAM_TIMEOUT` | `2.5` | seconds before an upstream call is abandoned |
+| `PRISM_PROVIDER_<NAME>_URL` / `_API_KEY` | from JSON | override a provider's base URL / secret (used by Docker) |
+| `PRISM_DB` | `/app/state/prism.sqlite3` | database path inside the container (on the `prism-state` volume) |
+
+### Container layout
+
+```
+                host machine
+   :8080 ------------------------+     +-- :9001 (failure injection)   +-- :9002
+                                 |     |                               |
+   +-----------------------------v-----v-------------------------------v------------+
+   |  compose network                                                                |
+   |   gateway  (uvicorn :8080) --http://alpha:9001/v1--> alpha (mock provider)      |
+   |      |                    \-http://beta:9002/v1---> beta  (mock provider)       |
+   |      +-- volume prism-state -> /app/state/prism.sqlite3                          |
+   +---------------------------------------------------------------------------------+
+```
+
+### Docker design decisions
+- **One image, three roles.** The mock providers are part of the provided pack, so a single `python:3.12-slim` image carries the gateway and the mocks; compose only changes the command. One build, one dependency set.
+- **Service names, not localhost.** Inside the compose network the gateway reaches providers at `alpha:9001` / `beta:9002`. The JSON config keeps its `localhost` defaults for non-Docker runs; the `PRISM_PROVIDER_<NAME>_URL` environment variables override them at deploy time without editing data files.
+- **Health-gated startup.** Providers expose a TCP health check; the gateway waits for both (`depends_on: condition: service_healthy`) and has its own `/health` check (also baked into the image).
+- **State in a named volume.** Keys, usage, request logs and cache entries survive `docker compose down`/`up`; `down -v` resets them. The seed file is re-applied on every start without resetting usage.
+- **Non-root runtime.** The app runs as an unprivileged user (uid 10001); only `/app/state` is writable.
+- **Layer caching.** `requirements.txt` is copied and installed before the source, so code edits rebuild in seconds. `.dockerignore` keeps `.venv`, `.git`, databases and caches out of the image.
+- **Published admin ports.** `9001`/`9002` are published on purpose so the live failover demo works from the host. In a real deployment you would not expose provider admin endpoints.
+
+### Troubleshooting
+- **`Cannot connect to the Docker daemon`**: start Docker Desktop and wait until it says it is running.
+- **`port is already allocated` / `address already in use`**: a local gateway or mock is still running. Stop it (Ctrl+C in its terminal) or change the left side of the port mapping in `docker-compose.yml` (for example `"8081:8080"`) and use that port in `--url`.
+- **Gateway container keeps restarting or is "unhealthy"**: `docker compose logs gateway` shows the error. Make sure `alpha` and `beta` are healthy first (`docker compose ps`).
+- **Requests return 502 right after `up`**: the providers were still starting; wait for `healthy` in `docker compose ps` and retry.
+- **Old behaviour after editing code**: rebuild with `docker compose up --build`.
+- **`verify.py` budget check fails**: you re-used a database where the budget-demo key is already exhausted. Run `docker compose down -v` and start again.
+
+## Quick start (without Docker)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -123,7 +232,7 @@ or the in-process `FakeProvider` used by the tests are interchangeable.
 ## Evaluation flow
 
 ```bash
-python3 -m pytest -q                                        # 40 automated tests (unit + integration with fake providers)
+python3 -m pytest -q                                        # 42 automated tests (unit + integration with fake providers)
 python3 scripts/smoke_test.py --url http://localhost:8080 --key prism-sk-search-1a2b3c --model fast
 python3 scripts/load_test.py  --url http://localhost:8080 --key prism-sk-free-7g8h9i --model fast --requests 30 --concurrency 10 --rpm-limit 10
 python3 scripts/routing_eval.py                             # one-command routing eval (add --json for the full report)

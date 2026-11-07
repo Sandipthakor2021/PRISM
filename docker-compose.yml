@@ -1,0 +1,54 @@
+# One command: docker compose up --build
+# Starts two mock providers (alpha, beta) and the Prism gateway on a private network.
+x-prism: &prism
+  build: .
+  image: prism-gateway:latest
+  restart: unless-stopped
+
+services:
+  alpha:
+    <<: *prism
+    container_name: prism-alpha
+    command: ["python", "scripts/mock_provider.py", "--port", "9001", "--name", "alpha"]
+    ports:
+      - "9001:9001"          # published so you can inject failures from your host: curl -X POST localhost:9001/admin/config ...
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9001), 2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  beta:
+    <<: *prism
+    container_name: prism-beta
+    command: ["python", "scripts/mock_provider.py", "--port", "9002", "--name", "beta"]
+    ports:
+      - "9002:9002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9002), 2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    <<: *prism
+    container_name: prism-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      # containers reach each other by service name, not localhost
+      PRISM_PROVIDER_ALPHA_URL: http://alpha:9001/v1
+      PRISM_PROVIDER_BETA_URL: http://beta:9002/v1
+      PRISM_ADMIN_TOKEN: ${PRISM_ADMIN_TOKEN:-prism-admin-demo}
+      PRISM_UPSTREAM_TIMEOUT: ${PRISM_UPSTREAM_TIMEOUT:-2.5}
+      PRISM_DB: /app/state/prism.sqlite3
+    volumes:
+      - prism-state:/app/state   # keys, usage, request logs and cache survive restarts
+    depends_on:
+      alpha:
+        condition: service_healthy
+      beta:
+        condition: service_healthy
+
+volumes:
+  prism-state:
