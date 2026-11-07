@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Prism Ops Console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#667;--card:#f4f2fb;--line:#d9d4ee;--acc:#5b3fd1;--ok:#137a3a;--bad:#b3261e;--warn:#9a6700}
+@media (prefers-color-scheme: dark){:root{--bg:#14121c;--fg:#ece9f7;--mut:#a8a3c0;--card:#1e1b2b;--line:#34304a;--acc:#9d86ff;--ok:#5fd18a;--bad:#ff8a80;--warn:#e3b341}}
+body{font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:16px 20px}
+h1{font-size:20px;margin:0 0 4px} h2{font-size:15px;margin:22px 0 8px;color:var(--acc)} .sub{color:var(--mut);margin-bottom:12px}
+.cards{display:flex;gap:10px;flex-wrap:wrap}.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;min-width:130px}
+.card b{display:block;font-size:20px}.card span{color:var(--mut);font-size:12px}
+.wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:760px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--mut);font-weight:600;font-size:12px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+input,button{font:inherit;padding:5px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--fg)}button{cursor:pointer}
+code{font-size:12px}.reason{white-space:normal;max-width:420px;color:var(--mut);font-size:12px}
+</style></head><body>
+<h1>Prism Ops Console</h1>
+<div class="sub">Admin token: <input id="tok" value="prism-admin-demo" size="18"> <button onclick="load()">Refresh</button>
+ <span id="stamp"></span></div>
+<div class="cards" id="cards"></div>
+<h2>Usage by key</h2><div class="wrap"><table id="usage"></table></div>
+<h2>Cache hit rate</h2><div class="wrap"><table id="cache"></table></div>
+<h2>Routing eval (<code>auto</code> router vs data/routing_eval.jsonl) <button onclick="runEval()">Run eval</button></h2>
+<div id="eval" class="sub">Not run yet.</div>
+<h2>Recent requests</h2><div class="wrap"><table id="logs"></table></div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function api(p){const r=await fetch(p,{headers:{'X-Admin-Token':$('tok').value}});if(!r.ok)throw new Error(p+' -> '+r.status);return r.json()}
+function table(el,head,rows){$(el).innerHTML='<tr>'+head.map(h=>'<th>'+h+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')}
+const usd=n=>'$'+Number(n).toFixed(6);
+function cls(s){return s==='ok'||s==='cache_hit'?'ok':(s.startsWith('rejected')?'warn':'bad')}
+async function load(){
+ try{
+  const [u,c,l]=await Promise.all([api('/admin/usage'),api('/admin/cache/stats'),api('/admin/logs?limit=40')]);
+  const tot=u.keys.reduce((a,k)=>({r:a.r+k.requests,c:a.c+k.cost_usd,rej:a.rej+k.rejected}),{r:0,c:0,rej:0});
+  $('cards').innerHTML=[['Served requests',tot.r],['Rejected',tot.rej],['Total spend',usd(tot.c)],['Cache hit rate',(c.hit_rate*100).toFixed(1)+'%'],['Cache entries',c.entries]]
+    .map(x=>'<div class="card"><b>'+x[1]+'</b><span>'+x[0]+'</span></div>').join('');
+  table('usage',['Team','Key','Requests','Rejected','Prompt tok','Completion tok','Cost (usd)','Cache hits','Budget used'],
+   u.keys.map(k=>[esc(k.team),'<code>'+esc(k.key)+'</code>',k.requests,k.rejected,k.prompt_tokens,k.completion_tokens,usd(k.cost_usd),k.cache_hits,
+     usd(k.spent_this_month_usd)+' / $'+k.monthly_budget_usd]));
+  table('cache',['Key','Hits','Misses','Hit rate'],Object.entries(c.per_key).map(([k,v])=>['<code>'+esc(k)+'</code>',v.hits,v.misses,(v.hit_rate*100).toFixed(1)+'%']));
+  table('logs',['Time','Key','Requested','Served by','Status','Cache','Fallback','Retries','Tokens in/out','Cost','Latency','Route reason'],
+   l.logs.map(x=>[esc(x.created_at.slice(11,19)),'<code>'+esc((x.virtual_key||'-').slice(0,18))+'</code>',esc(x.requested_model||'-')+(x.stream?' (stream)':''),
+     esc(x.resolved_provider?x.resolved_provider+'/'+x.resolved_model:'-'),'<span class="'+cls(x.status)+'">'+esc(x.status)+'</span>',esc(x.cache),
+     x.fallback?'<b class="warn">yes</b>':'no',x.retries,x.prompt_tokens+' / '+x.completion_tokens,usd(x.cost_usd),x.latency_ms+' ms','<span class="reason">'+esc(x.route_reason||x.error||'')+'</span>']));
+  $('stamp').textContent='updated '+new Date().toLocaleTimeString();
+ }catch(e){$('stamp').textContent='error: '+e.message}
+}
+async function runEval(){
+ try{const r=await api('/admin/routing/eval');
+  $('eval').innerHTML='<b>'+r.correct+'/'+r.total+' correct ('+(r.accuracy*100).toFixed(0)+'%)</b> &nbsp; length-only baseline: '+(r.length_only_baseline_accuracy*100).toFixed(0)+'%'+
+   '<div class="wrap"><table><tr><th>Case</th><th>Expected</th><th>Actual</th><th>Reason</th></tr>'+r.cases.map(c=>'<tr><td>'+c.id+'</td><td>'+c.expected+'</td><td class="'+(c.correct?'ok':'bad')+'">'+c.actual+'</td><td class="reason">'+esc(c.reason)+'</td></tr>').join('')+'</table></div>'}
+ catch(e){$('eval').textContent='error: '+e.message}
+}
+load();setInterval(load,4000);
+</script></body></html>
